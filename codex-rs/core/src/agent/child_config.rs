@@ -81,7 +81,6 @@ pub(crate) async fn prepare_agent_spawn_config(
         }
     }
     apply_spawn_agent_service_tier(session, &mut config).await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
 
     // Remember an applied configured default so cold reload reapplies its restrictions.
     let role_name = options

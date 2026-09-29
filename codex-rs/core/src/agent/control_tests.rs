@@ -827,12 +827,17 @@ async fn send_inter_agent_communication_without_turn_queues_message_without_trig
 
 #[tokio::test]
 async fn ensure_v2_agent_loaded_reloads_registered_unloaded_agent() {
-    check_v2_agent_reload(V2ReloadRoute::Sender).await;
+    check_v2_agent_reload(V2ReloadRoute::Sender, false).await;
 }
 
 #[tokio::test]
 async fn ensure_v2_child_loaded_preserves_evicted_parent_authority() {
-    check_v2_agent_reload(V2ReloadRoute::NestedParent).await;
+    check_v2_agent_reload(V2ReloadRoute::NestedParent, false).await;
+}
+
+#[tokio::test]
+async fn ensure_v2_child_loaded_keeps_role_read_only_after_parent_eviction() {
+    check_v2_agent_reload(V2ReloadRoute::NestedParent, true).await;
 }
 
 #[derive(Clone, Copy)]
@@ -869,7 +874,7 @@ async fn spawn_v2_reload_test_child(
         .expect("spawn_agent should succeed")
 }
 
-async fn check_v2_agent_reload(route: V2ReloadRoute) {
+async fn check_v2_agent_reload(route: V2ReloadRoute, role_read_only: bool) {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let _ = config.features.enable(Feature::Sqlite);
@@ -878,8 +883,25 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
     config.permissions.allow_login_shell = true;
     config
         .permissions
-        .set_permission_profile(PermissionProfile::read_only())
-        .expect("read-only parent profile");
+        .set_permission_profile(if role_read_only {
+            PermissionProfile::Disabled
+        } else {
+            PermissionProfile::read_only()
+        })
+        .expect("parent profile");
+    if role_read_only {
+        let role_path = home.path().join("read-only-worker.toml");
+        tokio::fs::write(&role_path, "sandbox_mode = \"read-only\"\n")
+            .await
+            .expect("write role file");
+        config.agent_roles.insert(
+            "read-only-worker".to_string(),
+            AgentRoleConfig {
+                config_file: Some(role_path),
+                ..Default::default()
+            },
+        );
+    }
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let client_mcp_extensions =
         ClientMcpExtensions::new([(OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({}))]);
@@ -932,8 +954,33 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
     assert!(inherited_instructions.thread.is_some());
     let mut child_config = harness.config.clone();
     child_config.model = Some("gpt-5.6-luna".to_string());
-    let spawned_agent =
-        spawn_v2_reload_test_child(&control, child_config, &parent_thread, "worker").await;
+    let spawned_agent = if role_read_only {
+        crate::agent::role::apply_role_to_config(&mut child_config, Some("read-only-worker"))
+            .await
+            .expect("apply child role");
+        let source = thread_spawn_source(
+            parent_thread.session.thread_id,
+            &parent_thread.session_source,
+            next_thread_spawn_depth(&parent_thread.session_source),
+            Some("read-only-worker"),
+            Some("worker".to_string()),
+        )
+        .expect("child source");
+        control
+            .spawn_agent_with_metadata(
+                child_config,
+                text_input("hello child"),
+                source,
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread.session.thread_id),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("spawn role child")
+    } else {
+        spawn_v2_reload_test_child(&control, child_config, &parent_thread, "worker").await
+    };
     let agent_path = spawned_agent
         .metadata
         .agent_path
@@ -944,6 +991,16 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("child thread should exist");
+    if role_read_only {
+        assert_eq!(
+            child_thread
+                .session
+                .new_default_turn()
+                .await
+                .permission_profile(),
+            PermissionProfile::read_only()
+        );
+    }
     child_thread
         .inject_response_items(vec![assistant_message(
             "child persisted",
@@ -1042,13 +1099,23 @@ async fn check_v2_agent_reload(route: V2ReloadRoute) {
         .get_thread(spawned_agent.thread_id)
         .await
         .expect("reloaded child thread should exist");
+    if role_read_only {
+        assert_eq!(
+            reloaded_child
+                .session
+                .new_default_turn()
+                .await
+                .permission_profile(),
+            PermissionProfile::read_only()
+        );
+    }
     let reloaded_instructions = reloaded_child.session.inherited_instructions().await;
     assert_eq!(
         (reloaded_instructions.user, reloaded_instructions.thread),
         (inherited_instructions.user, inherited_instructions.thread),
         "reloading a child must retain both parent snapshots, even if residency evicts the parent",
     );
-    if matches!(route, V2ReloadRoute::NestedParent) {
+    if matches!(route, V2ReloadRoute::NestedParent) && !role_read_only {
         let reloaded_turn = reloaded_child.session.new_default_turn().await;
         assert_eq!(
             (

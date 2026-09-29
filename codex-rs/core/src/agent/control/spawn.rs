@@ -412,19 +412,6 @@ impl LocalAgentControl {
             let runtime_approval_policy = config.permissions.approval_policy.value();
             let runtime_approvals_reviewer = config.approvals_reviewer;
             let runtime_cwd = config.cwd.clone();
-            let runtime_permission_profile = match config.permissions.active_permission_profile() {
-                Some(active_permission_profile) => {
-                    PermissionProfileSnapshot::active_with_profile_workspace_roots(
-                        config.permissions.permission_profile().clone(),
-                        active_permission_profile,
-                        config.permissions.profile_workspace_roots().to_vec(),
-                    )
-                }
-                None => PermissionProfileSnapshot::legacy(
-                    config.permissions.permission_profile().clone(),
-                ),
-            };
-
             apply_role_to_config(&mut config, Some(&role_name))
                 .await
                 .map_err(CodexErr::InvalidRequest)?;
@@ -437,12 +424,6 @@ impl LocalAgentControl {
                 })?;
             config.approvals_reviewer = runtime_approvals_reviewer;
             config.cwd = runtime_cwd;
-            config
-                .permissions
-                .set_permission_profile_from_session_snapshot(runtime_permission_profile)
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
-                })?;
         }
         config.service_tier = self.root_service_tier();
         if let Some(model) = stored_model {
@@ -474,6 +455,9 @@ impl LocalAgentControl {
                     "cannot resume multi-agent v2 child {thread_id}: parent execution policy has changed; retry through the parent"
                 )));
             }
+            if environment_selections.is_none() {
+                environment_selections = Some(parent_environments.inheritable_selections());
+            }
             if let Some(selections) = environment_selections.as_mut() {
                 for selection in selections {
                     let environment_id = &selection.environment_id;
@@ -496,12 +480,8 @@ impl LocalAgentControl {
                         })?;
                     let owner_config = owner_environment.config();
                     let child_config = match &selection.config {
-                        EnvironmentConfigState::FromThread => {
-                            // Pin current owner authority instead of re-inferring child settings.
-                            selection.config = EnvironmentConfigState::Ready(owner_config.clone());
-                            continue;
-                        }
-                        EnvironmentConfigState::Ready(config) => config,
+                        EnvironmentConfigState::FromThread => owner_config.clone(),
+                        EnvironmentConfigState::Ready(config) => config.clone(),
                         EnvironmentConfigState::Pending | EnvironmentConfigState::Failed(_) => {
                             return Err(invalid_environment("configuration is not ready"));
                         }
@@ -511,14 +491,6 @@ impl LocalAgentControl {
                     if bounded_config != *owner_config {
                         return Err(invalid_environment(
                             "configuration differs from the current parent",
-                        ));
-                    }
-                    if child_config.permission_profile == owner_config.permission_profile {
-                        continue;
-                    }
-                    if owner_environment.environment.is_remote() {
-                        return Err(invalid_environment(
-                            "permissions changed on a remote executor",
                         ));
                     }
                     let cwd = selection.cwd.to_abs_path().map_err(|_| {
@@ -541,13 +513,29 @@ impl LocalAgentControl {
                         .permission_profile()
                         .clone()
                         .materialize_project_roots_with_workspace_roots(&roots);
+                    let role_permissions = config
+                        .permissions
+                        .effective_permission_profile()
+                        .materialize_project_roots_with_workspace_roots(&roots);
                     let permissions =
                         intersect_effective_permission_profiles(&authority, &requested, &cwd)
+                            .and_then(|permissions| {
+                                intersect_effective_permission_profiles(
+                                    &permissions,
+                                    &role_permissions,
+                                    &cwd,
+                                )
+                            })
                             .map_err(|err| {
                                 invalid_environment(&format!(
                                     "permissions cannot be intersected safely: {err}"
                                 ))
                             })?;
+                    if owner_environment.environment.is_remote() && permissions != authority {
+                        return Err(invalid_environment(
+                            "permissions changed on a remote executor",
+                        ));
+                    }
                     bounded_config.permission_profile =
                         PermissionProfileSnapshot::legacy(permissions);
                     selection.config = EnvironmentConfigState::Ready(bounded_config);

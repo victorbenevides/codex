@@ -2293,8 +2293,10 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
 
 // TODO(anp): Restore this test on Linux once sandbox helpers work inside test microVMs.
 #[cfg_attr(target_os = "linux", ignore)]
+#[test_case::test_case(false; "runtime_policy_without_role_sandbox")]
+#[test_case::test_case(true; "role_read_only_bounds_inherited_runtime_policy")]
 #[tokio::test]
-async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
+async fn spawn_agent_reapplies_runtime_sandbox_after_role_config(role_restricts_sandbox: bool) {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
@@ -2353,6 +2355,18 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         .expect("test setup should allow updating permission profile");
     set_turn_config(&mut turn, config);
     let role_name = install_role_with_model_override(&mut turn).await;
+    if role_restricts_sandbox {
+        let role_path = turn.config.agent_roles[&role_name]
+            .config_file
+            .as_ref()
+            .expect("configured role file");
+        tokio::fs::write(
+            role_path,
+            "model = \"gpt-5-role-override\"\nmodel_reasoning_effort = \"minimal\"\nsandbox_mode = \"read-only\"\n",
+        )
+        .await
+        .expect("role should be narrowed to read-only");
+    }
     let mut role_config = (*turn.config).clone();
     crate::agent::role::apply_role_to_config(&mut role_config, Some(role_name.as_str()))
         .await
@@ -2412,6 +2426,34 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         .expect("spawned agent thread should exist")
         .config_snapshot()
         .await;
+    if role_restricts_sandbox {
+        let entries = snapshot
+            .permission_profile
+            .file_system_sandbox_policy()
+            .entries;
+        assert!(
+            entries
+                .iter()
+                .all(|entry| { entry.access != FileSystemAccessMode::Write })
+        );
+        assert!(entries.iter().any(|entry| {
+            matches!(&entry.path, FileSystemPath::GlobPattern { pattern } if pattern == "**/.env")
+                && entry.access == FileSystemAccessMode::Deny
+        }));
+        assert_eq!(
+            snapshot.permission_profile.network_sandbox_policy(),
+            PermissionProfile::read_only().network_sandbox_policy()
+        );
+        let child = manager
+            .get_thread(agent_id)
+            .await
+            .expect("spawned child should remain available");
+        assert_eq!(
+            child.session.new_default_turn().await.permission_profile(),
+            snapshot.permission_profile
+        );
+        return;
+    }
     assert_eq!(snapshot.sandbox_policy(), expected_sandbox);
     assert_eq!(snapshot.approval_policy, AskForApproval::OnRequest);
     assert_eq!(snapshot.approvals_reviewer, ApprovalsReviewer::AutoReview);
@@ -4543,6 +4585,56 @@ async fn tool_handlers_cascade_close_and_resume_and_keep_explicitly_closed_subtr
         .await;
     assert_eq!(shutdown_report.submit_failed, Vec::<ThreadId>::new());
     assert_eq!(shutdown_report.timed_out, Vec::<ThreadId>::new());
+}
+
+#[tokio::test]
+async fn spawn_config_keeps_role_sandbox_after_runtime_overrides() {
+    let (session, mut turn) = make_session_and_context().await;
+    let role_path = turn
+        .config
+        .codex_home
+        .as_path()
+        .join("read-only-agent.toml");
+    tokio::fs::create_dir_all(&turn.config.codex_home)
+        .await
+        .expect("codex home should exist");
+    tokio::fs::write(
+        &role_path,
+        "developer_instructions = \"Inspect only\"\nsandbox_mode = \"read-only\"\n",
+    )
+    .await
+    .expect("role file should be written");
+    let mut config = (*turn.config).clone();
+    config
+        .permissions
+        .set_permission_profile(PermissionProfile::Disabled)
+        .expect("parent should allow unrestricted profile");
+    config.agent_roles.insert(
+        "read-only-agent".to_string(),
+        AgentRoleConfig {
+            config_file: Some(role_path),
+            ..Default::default()
+        },
+    );
+    set_turn_config(&mut turn, config);
+    let step = StepContext::for_test(Arc::new(turn));
+    let child = crate::agent::child_config::prepare_agent_spawn_config(
+        &session,
+        &step,
+        crate::agent::child_config::SpawnConfigOptions {
+            version: crate::agent::child_config::SpawnConfigVersion::V2,
+            full_history_fork: false,
+            role_name: Some("read-only-agent"),
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await
+    .expect("spawn configuration should succeed");
+    assert_eq!(
+        child.config.permissions.effective_permission_profile(),
+        PermissionProfile::read_only()
+    );
 }
 
 #[test_case::test_case(false; "inactive_parent")]

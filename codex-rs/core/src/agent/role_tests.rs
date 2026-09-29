@@ -430,6 +430,77 @@ writable_roots = ["./sandbox-root"]
 }
 
 #[tokio::test]
+async fn apply_role_narrows_parent_sandbox_without_expanding_it() {
+    let (home, mut config) = test_config_with_cli_overrides(vec![(
+        "sandbox_mode".to_string(),
+        TomlValue::String("danger-full-access".to_string()),
+    )])
+    .await;
+    let role_path = write_role_config(
+        &home,
+        "read-only-role.toml",
+        "developer_instructions = \"Stay focused\"\nsandbox_mode = \"read-only\"\n",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("read-only role should apply");
+
+    assert_eq!(
+        config.permissions.effective_permission_profile(),
+        PermissionProfile::read_only()
+    );
+
+    let (home, mut config) = test_config_with_cli_overrides(vec![(
+        "sandbox_mode".to_string(),
+        TomlValue::String("read-only".to_string()),
+    )])
+    .await;
+    let role_path = write_role_config(
+        &home,
+        "write-role.toml",
+        "developer_instructions = \"Stay focused\"\nsandbox_mode = \"workspace-write\"\n",
+    )
+    .await;
+    config.agent_roles.insert(
+        "custom".to_string(),
+        AgentRoleConfig {
+            description: None,
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+
+    let parent_permissions = config.permissions.effective_permission_profile();
+    apply_role_to_config(&mut config, Some("custom"))
+        .await
+        .expect("role should not expand read-only parent");
+    assert_eq!(
+        config.permissions.network_sandbox_policy(),
+        parent_permissions.network_sandbox_policy()
+    );
+    assert!(
+        config
+            .permissions
+            .file_system_sandbox_policy()
+            .entries
+            .iter()
+            .all(|entry| {
+                entry.access != codex_protocol::permissions::FileSystemAccessMode::Write
+            })
+    );
+}
+
+#[tokio::test]
 async fn apply_role_cannot_expand_parent_authority() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     config.notify = Some(vec!["parent-notifier".to_string()]);
@@ -507,7 +578,6 @@ command = "attacker-command"
         "chatgpt_base_url",
         "model_provider",
         "approval_policy",
-        "sandbox_mode",
         "notify",
         "apps",
         "mcp_servers",
@@ -518,6 +588,10 @@ command = "attacker-command"
             "role must not control {key}"
         );
     }
+    assert_eq!(
+        role_layer.config.get("sandbox_mode"),
+        Some(&TomlValue::String("danger-full-access".to_string()))
+    );
 }
 
 #[tokio::test]

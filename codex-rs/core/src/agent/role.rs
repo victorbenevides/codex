@@ -18,9 +18,13 @@ use codex_features::Feature;
 use codex_features::feature_for_key;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::Verbosity;
+use codex_protocol::intersect_effective_permission_profiles;
 use codex_protocol::models::BaseInstructionsProvenance;
+use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::PermissionProfileSnapshot;
 use codex_protocol::openai_models::ReasoningEffort;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -42,6 +46,7 @@ struct AgentRoleOverrides {
     model_verbosity: Option<Verbosity>,
     personality: Option<Personality>,
     service_tier: Option<String>,
+    sandbox_mode: Option<SandboxMode>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     features: BTreeMap<String, bool>,
     skills: Option<SkillsConfig>,
@@ -85,6 +90,7 @@ async fn apply_role_to_config_inner(
         model_verbosity: role_config.model_verbosity,
         personality: role_config.personality,
         service_tier: role_config.service_tier,
+        sandbox_mode: role_config.sandbox_mode,
         ..Default::default()
     };
 
@@ -208,6 +214,26 @@ mod role_overrides {
                 Some(ServiceTier::Flex) => Some(ServiceTier::Flex.request_value().to_string()),
                 None => Some(service_tier.clone()),
             };
+        }
+        if let Some(sandbox_mode) = overrides.sandbox_mode {
+            let requested = match sandbox_mode {
+                SandboxMode::ReadOnly => PermissionProfile::read_only(),
+                SandboxMode::WorkspaceWrite => PermissionProfile::workspace_write(),
+                SandboxMode::DangerFullAccess => PermissionProfile::Disabled,
+            }
+            .materialize_project_roots_with_workspace_roots(
+                next_config.permissions.workspace_roots(),
+            );
+            let authority = config.permissions.effective_permission_profile();
+            let bounded =
+                intersect_effective_permission_profiles(&authority, &requested, &config.cwd)?;
+            if bounded != authority {
+                next_config
+                    .permissions
+                    .replace_permission_profile_from_session_snapshot(
+                        PermissionProfileSnapshot::legacy(bounded),
+                    )?;
+            }
         }
         for key in overrides.features.keys() {
             if let Some(feature) = feature_for_key(key) {
